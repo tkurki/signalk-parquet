@@ -191,7 +191,7 @@ scripts/cassiopeia-parquet/verify_position.ts
 
 DuckDB handles all decoding of `BINARY` columns automatically when casting to `VARCHAR`. The conversion iterates over ~96 day partitions, writing each directly to a Parquet file via DuckDB's `COPY TO` — no intermediate in-memory table or separate Parquet writer is needed. With a maximum of ~607K rows on the busiest day, each partition is well within DuckDB's streaming write capacity.
 
-Scripts are written in TypeScript and executed directly with `node --strip-types` (Node ≥ 22.6.0), which strips type annotations at runtime without a compile step. All dependencies (`@duckdb/node-api`) are already present in the project's `node_modules`.
+Scripts are written in TypeScript and executed directly with `node --experimental-strip-types` (Node ≥ 22.6.0), which strips type annotations at runtime without a compile step. All dependencies (`@duckdb/node-api`) are already present in the project's `node_modules`.
 
 ```typescript
 // Pseudocode (convert_position.ts)
@@ -256,7 +256,7 @@ scripts/cassiopeia-parquet/
 ```
 
 No extra dependencies — `@duckdb/node-api` is already in the project's
-`node_modules`. Scripts run directly with `node --strip-types` (Node ≥ 22.6.0),
+`node_modules`. Scripts run directly with `node --experimental-strip-types` (Node ≥ 22.6.0),
 which strips TypeScript type annotations without a compile step.
 
 ### Usage
@@ -266,12 +266,12 @@ which strips TypeScript type annotations without a compile step.
 cd scripts/cassiopeia-parquet
 
 # Convert (writes to a configurable output directory)
-node --strip-types convert_position.ts \
+node --experimental-strip-types convert_position.ts \
   --input ../../stash-cassiopeia-data/cassiopeia_trackpoint.parquet \
   --output /path/to/signalk-data-dir
 
 # Verify
-node --strip-types verify_position.ts --data-dir /path/to/signalk-data-dir
+node --experimental-strip-types verify_position.ts --data-dir /path/to/signalk-data-dir
 ```
 
 ---

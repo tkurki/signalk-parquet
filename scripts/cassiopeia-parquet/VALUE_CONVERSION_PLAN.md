@@ -369,7 +369,7 @@ Instead, use DuckDB to:
 2. For each group, transform and write rows directly via `COPY (...) TO (FORMAT PARQUET)` — no intermediate in-memory table required
 3. No extra dependencies: `@duckdb/node-api` is already in the project's `node_modules`
 
-Scripts are written in TypeScript and executed directly with `node --strip-types`
+Scripts are written in TypeScript and executed directly with `node --experimental-strip-types`
 (Node ≥ 22.6.0), which strips type annotations at runtime without a compile step.
 
 ```typescript
@@ -437,7 +437,7 @@ scripts/cassiopeia-parquet/
 ```
 
 No extra dependencies — `@duckdb/node-api` is already in the project's
-`node_modules`. Scripts run directly with `node --strip-types` (Node ≥ 22.6.0),
+`node_modules`. Scripts run directly with `node --experimental-strip-types` (Node ≥ 22.6.0),
 which strips TypeScript type annotations without a compile step.
 
 ### Usage
@@ -447,16 +447,16 @@ which strips TypeScript type annotations without a compile step.
 cd scripts/cassiopeia-parquet
 
 # Step 1: Convert raw values
-node --strip-types convert_values.ts \
+node --experimental-strip-types convert_values.ts \
   --input ../../stash-cassiopeia-data/cassiopeia_value.parquet \
   --output /path/to/signalk-data-dir
 
 # Step 2: Aggregate all tiers (raw → 5s → 60s → 1h)
-node --strip-types aggregate_values.ts \
+node --experimental-strip-types aggregate_values.ts \
   --data-dir /path/to/signalk-data-dir
 
 # Step 3: Verify
-node --strip-types verify_values.ts --data-dir /path/to/signalk-data-dir
+node --experimental-strip-types verify_values.ts --data-dir /path/to/signalk-data-dir
 ```
 
 ---
