@@ -97,7 +97,7 @@ one day's data for one context+path.
 ### Step 1: Enumerate day partitions with DuckDB
 
 ```
-scripts/cassiopeia-parquet/convert_position.py
+scripts/cassiopeia-parquet/convert_position.ts
 ```
 
 Open the source file with DuckDB and query the distinct `(year, day_of_year)` partitions present, applying the lat/lng validity filter up-front:
@@ -112,13 +112,15 @@ GROUP BY 1
 ORDER BY 1
 ```
 
-### Step 2: Extract and transform one day at a time
+### Step 2: Extract, transform, and write one day at a time
 
-For each `day_epoch`, run a single DuckDB query that performs all column
-transformations in SQL and returns a PyArrow table:
+For each `day_epoch`, use a single DuckDB `COPY (...) TO` statement that performs
+all column transformations in SQL and writes directly to a Parquet file — no
+intermediate in-memory table required:
 
 ```sql
-SELECT
+COPY (
+  SELECT
     strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
         || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z'
         AS received_timestamp,
@@ -131,11 +133,12 @@ SELECT
     lng                                     AS value_longitude,
     CAST(sourceRef AS VARCHAR)              AS source,
     CAST(sourceRef AS VARCHAR)              AS source_label
-FROM read_parquet('cassiopeia_trackpoint.parquet')
-WHERE lat BETWEEN -90 AND 90
-  AND lng BETWEEN -180 AND 180
-  AND CAST(ts / 86400 AS INTEGER) = ?
-ORDER BY ts, millis
+  FROM read_parquet('<input_file>')
+  WHERE lat BETWEEN -90 AND 90
+    AND lng BETWEEN -180 AND 180
+    AND CAST(ts / 86400 AS INTEGER) = <day_epoch>
+  ORDER BY ts, millis
+) TO '<output_file>' (FORMAT PARQUET, COMPRESSION 'SNAPPY')
 ```
 
 | Target Column          | Source Expression |
@@ -151,14 +154,14 @@ ORDER BY ts, millis
 
 ### Step 3: Write Hive-partitioned Parquet files
 
-For each `(year, day)` group from the PyArrow result:
+The `COPY TO` in Step 2 writes directly to the target file. Before running the
+query, build the output path and create the directory:
 1. Build target directory:
    ```
    {output_dir}/tier=raw/context=vessels__urn-mrn-imo-mmsi-230029970/path=navigation__position/year={YYYY}/day={DDD}/
    ```
-2. Write the already-sorted PyArrow table as a Parquet file:
-   `data_{YYYYMMDD}T000000.parquet`
-3. Use Snappy compression (consistent with plugin's DuckDB consolidation)
+2. Output file name: `data_{YYYYMMDD}T000000.parquet`
+3. Snappy compression is specified in the `COPY TO` clause — consistent with the plugin's DuckDB consolidation
 
 ### Step 4: Aggregation — not applicable
 
@@ -175,7 +178,7 @@ consistent with the plugin's behaviour.
 ### Step 5: Verify output
 
 ```
-scripts/cassiopeia-parquet/verify_position.py
+scripts/cassiopeia-parquet/verify_position.ts
 ```
 
 1. Use DuckDB to count total rows across all output files and compare against source (minus filtered rows)
@@ -186,42 +189,55 @@ scripts/cassiopeia-parquet/verify_position.py
 
 ## Implementation Strategy
 
-DuckDB handles all decoding of `BINARY` columns automatically when casting to `VARCHAR`. The conversion iterates over ~96 day partitions, extracting and writing one PyArrow table per day. With a maximum of ~607K rows on the busiest day, each partition fits comfortably in memory.
+DuckDB handles all decoding of `BINARY` columns automatically when casting to `VARCHAR`. The conversion iterates over ~96 day partitions, writing each directly to a Parquet file via DuckDB's `COPY TO` — no intermediate in-memory table or separate Parquet writer is needed. With a maximum of ~607K rows on the busiest day, each partition is well within DuckDB's streaming write capacity.
 
-```python
-# Pseudocode
-con = duckdb.connect()
+Scripts are written in TypeScript and executed directly with `node --strip-types` (Node ≥ 22.6.0), which strips type annotations at runtime without a compile step. All dependencies (`@duckdb/node-api`) are already present in the project's `node_modules`.
 
-# Step 1: enumerate partitions
-day_epochs = [
-    row[0] for row in con.execute("""
-        SELECT CAST(ts / 86400 AS INTEGER)
-        FROM read_parquet('source.parquet')
-        WHERE lat BETWEEN -90 AND 90 AND lng BETWEEN -180 AND 180
-        GROUP BY 1 ORDER BY 1
-    """).fetchall()
-]
+```typescript
+// Pseudocode (convert_position.ts)
+import { DuckDBInstance } from '@duckdb/node-api';
+import { mkdirSync } from 'fs';
+import { join } from 'path';
 
-for day_epoch in day_epochs:
-    # Step 2: extract + transform
-    arrow_table = con.execute("""
-        SELECT
-            strftime(...) AS received_timestamp,
-            strftime(...) AS signalk_timestamp,
-            'vessels.' || CAST(context AS VARCHAR) AS context,
-            'navigation.position' AS path,
-            lat AS value_latitude,
-            lng AS value_longitude,
-            CAST(sourceRef AS VARCHAR) AS source,
-            CAST(sourceRef AS VARCHAR) AS source_label
-        FROM read_parquet('source.parquet')
-        WHERE lat BETWEEN -90 AND 90 AND lng BETWEEN -180 AND 180
-          AND CAST(ts / 86400 AS INTEGER) = ?
-        ORDER BY ts, millis
-    """, [day_epoch]).arrow()
+const instance = await DuckDBInstance.create(':memory:');
+const con = await instance.connect();
 
-    # Step 3: write to Hive path
-    pq.write_table(arrow_table, hive_path(day_epoch), compression='snappy')
+// Step 1: enumerate partitions
+const partResult = await con.runAndReadAll(`
+  SELECT CAST(ts / 86400 AS INTEGER)
+  FROM read_parquet('${inputFile}')
+  WHERE lat BETWEEN -90 AND 90 AND lng BETWEEN -180 AND 180
+  GROUP BY 1 ORDER BY 1
+`);
+const dayEpochs = partResult.getRows().map((r) => r[0] as number);
+
+for (const dayEpoch of dayEpochs) {
+  const d = epochDayToDate(dayEpoch);
+  const outDir = buildOutputDir(outputDir, d);
+  mkdirSync(outDir, { recursive: true });
+  const outFile = join(outDir, buildFilename(d));
+
+  // Steps 2 + 3: transform and write in a single COPY TO
+  await con.run(`
+    COPY (
+      SELECT
+        strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
+            || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z' AS received_timestamp,
+        strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
+            || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z' AS signalk_timestamp,
+        'vessels.' || CAST(context AS VARCHAR) AS context,
+        'navigation.position' AS path,
+        lat AS value_latitude,
+        lng AS value_longitude,
+        CAST(sourceRef AS VARCHAR) AS source,
+        CAST(sourceRef AS VARCHAR) AS source_label
+      FROM read_parquet('${inputFile}')
+      WHERE lat BETWEEN -90 AND 90 AND lng BETWEEN -180 AND 180
+        AND CAST(ts / 86400 AS INTEGER) = ${dayEpoch}
+      ORDER BY ts, millis
+    ) TO '${outFile}' (FORMAT PARQUET, COMPRESSION 'SNAPPY')
+  `);
+}
 ```
 
 ---
@@ -233,26 +249,29 @@ scripts/cassiopeia-parquet/
 ├── POSITION_CONVERSION_PLAN.md  # This document
 ├── VALUE_CONVERSION_PLAN.md     # Value conversion plan
 ├── README.md                    # Usage instructions
-├── convert_position.py          # Position conversion script
-├── verify_position.py           # Position verification
-├── convert_values.py            # Value conversion script
-├── verify_values.py             # Value verification
-└── requirements.txt             # Python deps (pyarrow, duckdb)
+├── convert_position.ts          # Position conversion script
+├── verify_position.ts           # Position verification
+├── convert_values.ts            # Value conversion script
+├── verify_values.ts             # Value verification
 ```
+
+No extra dependencies — `@duckdb/node-api` is already in the project's
+`node_modules`. Scripts run directly with `node --strip-types` (Node ≥ 22.6.0),
+which strips TypeScript type annotations without a compile step.
 
 ### Usage
 
 ```bash
-# From project root, with venv activated:
+# From project root:
 cd scripts/cassiopeia-parquet
 
 # Convert (writes to a configurable output directory)
-python convert_position.py \
+node --strip-types convert_position.ts \
   --input ../../stash-cassiopeia-data/cassiopeia_trackpoint.parquet \
   --output /path/to/signalk-data-dir
 
 # Verify
-python verify_position.py --data-dir /path/to/signalk-data-dir
+node --strip-types verify_position.ts --data-dir /path/to/signalk-data-dir
 ```
 
 ---
@@ -278,7 +297,7 @@ python verify_position.py --data-dir /path/to/signalk-data-dir
 ## Compatibility Verification
 
 After conversion, the output should be queryable by the plugin's DuckDB-based
-History API. Verification queries (from `verify_position.py`):
+History API. Verification queries (from `verify_position.ts`):
 
 ```sql
 -- Row count verification (should equal source minus 137 filtered rows)

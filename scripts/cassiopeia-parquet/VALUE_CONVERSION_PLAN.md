@@ -145,7 +145,7 @@ Using DuckDB for efficient streaming of the 138.8M row file without loading
 everything into memory.
 
 ```
-scripts/cassiopeia-parquet/convert_values.py
+scripts/cassiopeia-parquet/convert_values.ts
 ```
 
 1. Open `stash-cassiopeia-data/cassiopeia_value.parquet` with DuckDB
@@ -224,30 +224,30 @@ The plugin calls `app.getMetadata(path)` at runtime to check `units === 'rad'`.
 The batch script has no running SignalK server, so uses a static allowlist derived
 from the SignalK specification for all angular paths present in this dataset:
 
-```python
-ANGULAR_PATHS = {
-    # Navigation headings and courses (rad)
-    'navigation.headingMagnetic',
-    'navigation.headingTrue',
-    'navigation.headingTrueCalc',
-    'navigation.courseOverGroundTrue',
-    'navigation.courseOverGroundMagnetic',
-    'navigation.magneticVariation',
-    'navigation.courseGreatCircle.bearingTrackTrue',
-    'navigation.courseGreatCircle.nextPoint.bearingTrue',
-    # Wind angles (rad)
-    'environment.wind.angleApparent',
-    'environment.wind.angleTrueGround',
-    'environment.wind.angleTrueWater',
-    'environment.wind.directionGround',
-    'environment.wind.directionMagnetic',
-    'environment.wind.directionTrue',
-    # Steering (rad)
-    'steering.rudderAngle',
-    # Non-standard derived paths present in this dataset
-    'variation',
-    'headingMag',
-}
+```typescript
+const ANGULAR_PATHS = new Set<string>([
+  // Navigation headings and courses (rad)
+  'navigation.headingMagnetic',
+  'navigation.headingTrue',
+  'navigation.headingTrueCalc',
+  'navigation.courseOverGroundTrue',
+  'navigation.courseOverGroundMagnetic',
+  'navigation.magneticVariation',
+  'navigation.courseGreatCircle.bearingTrackTrue',
+  'navigation.courseGreatCircle.nextPoint.bearingTrue',
+  // Wind angles (rad)
+  'environment.wind.angleApparent',
+  'environment.wind.angleTrueGround',
+  'environment.wind.angleTrueWater',
+  'environment.wind.directionGround',
+  'environment.wind.directionMagnetic',
+  'environment.wind.directionTrue',
+  // Steering (rad)
+  'steering.rudderAngle',
+  // Non-standard derived paths present in this dataset
+  'variation',
+  'headingMag',
+]);
 ```
 
 #### DuckDB aggregation queries (identical to plugin)
@@ -348,7 +348,7 @@ The same `60s → 1h` query applies with `INTERVAL '3600 seconds'`.
 ### Step 6: Verify output
 
 ```
-scripts/cassiopeia-parquet/verify_values.py
+scripts/cassiopeia-parquet/verify_values.ts
 ```
 
 1. Glob all output `.parquet` files
@@ -362,50 +362,63 @@ scripts/cassiopeia-parquet/verify_values.py
 
 ## Implementation Strategy: Streaming with DuckDB
 
-Given 138.8M rows, the converter should **not** load the entire file into pandas.
+Given 138.8M rows, the converter should **not** load the entire file into memory.
 Instead, use DuckDB to:
 
 1. Query the distinct `(path, date)` groups first
-2. For each group, extract and transform rows directly into a PyArrow table
-3. Write each group to its target Hive location
+2. For each group, transform and write rows directly via `COPY (...) TO (FORMAT PARQUET)` — no intermediate in-memory table required
+3. No extra dependencies: `@duckdb/node-api` is already in the project's `node_modules`
 
-```python
-# Pseudocode
-con = duckdb.connect()
+Scripts are written in TypeScript and executed directly with `node --strip-types`
+(Node ≥ 22.6.0), which strips type annotations at runtime without a compile step.
 
-# Get all distinct (path, date) partitions
-partitions = con.execute("""
-    SELECT CAST(path AS VARCHAR) as p,
-           CAST(ts / 86400 AS INTEGER) as day_epoch
-    FROM read_parquet('source.parquet')
-    GROUP BY 1, 2
-""").fetchall()
+```typescript
+// Pseudocode (convert_values.ts)
+import { DuckDBInstance } from '@duckdb/node-api';
+import { mkdirSync } from 'fs';
+import { join } from 'path';
 
-for path_str, day_epoch in partitions:
-    # Extract and transform one partition
-    table = con.execute("""
-        SELECT
-            strftime(to_timestamp(ts) + to_milliseconds(millis),
-                     '%Y-%m-%dT%H:%M:%S.') ||
-                lpad(CAST(millis AS VARCHAR), 3, '0') || 'Z'
-                AS received_timestamp,
-            ... same as signalk_timestamp ...
-            'vessels.' || CAST(context AS VARCHAR) AS context,
-            CAST(path AS VARCHAR) AS path,
-            CAST(value AS DOUBLE) AS value,
-            CAST(sourceRef AS VARCHAR) AS source,
-            CAST(sourceRef AS VARCHAR) AS source_label
-        FROM read_parquet('source.parquet')
-        WHERE CAST(path AS VARCHAR) = ?
-          AND CAST(ts / 86400 AS INTEGER) = ?
-        ORDER BY ts, millis
-    """, [path_str, day_epoch]).arrow()
+const instance = await DuckDBInstance.create(':memory:');
+const con = await instance.connect();
 
-    # Write to Hive path
-    write_parquet(table, hive_path(path_str, day_epoch))
+// Get all distinct (path, date) partitions
+const partResult = await con.runAndReadAll(`
+  SELECT CAST(path AS VARCHAR) AS p,
+         CAST(ts / 86400 AS INTEGER) AS day_epoch
+  FROM read_parquet('${inputFile}')
+  GROUP BY 1, 2
+  ORDER BY 1, 2
+`);
+const partitions = partResult.getRows() as [string, number][];
+
+for (const [pathStr, dayEpoch] of partitions) {
+  const outDir = buildOutputDir(outputDir, pathStr, dayEpoch);
+  mkdirSync(outDir, { recursive: true });
+  const outFile = join(outDir, buildFilename(dayEpoch));
+
+  // Extract, transform, and write in a single COPY TO
+  await con.run(`
+    COPY (
+      SELECT
+        strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
+            || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z' AS received_timestamp,
+        strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
+            || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z' AS signalk_timestamp,
+        'vessels.' || CAST(context AS VARCHAR) AS context,
+        CAST(path AS VARCHAR) AS path,
+        CAST(value AS DOUBLE) AS value,
+        CAST(sourceRef AS VARCHAR) AS source,
+        CAST(sourceRef AS VARCHAR) AS source_label
+      FROM read_parquet('${inputFile}')
+      WHERE CAST(path AS VARCHAR) = '${pathStr.replace(/'/g, "''")}'
+        AND CAST(ts / 86400 AS INTEGER) = ${dayEpoch}
+      ORDER BY ts, millis
+    ) TO '${outFile}' (FORMAT PARQUET, COMPRESSION 'SNAPPY')
+  `);
+}
 ```
 
-This keeps memory usage proportional to one day of one path (~max 600K rows for the busiest path/day combination, well within memory limits).
+This keeps memory usage minimal: DuckDB streams each partition directly to disk.
 
 ---
 
@@ -416,31 +429,34 @@ scripts/cassiopeia-parquet/
 ├── POSITION_CONVERSION_PLAN.md  # Position conversion plan
 ├── VALUE_CONVERSION_PLAN.md     # This document
 ├── README.md                    # Usage instructions
-├── convert_position.py          # Position (trackpoint) conversion script
-├── verify_position.py           # Position verification
-├── convert_values.py            # Value conversion script
-├── aggregate_values.py          # Aggregation script (raw → 5s → 60s → 1h)
-├── verify_values.py             # Value verification
-└── requirements.txt             # Python deps (pyarrow, duckdb)
+├── convert_position.ts          # Position (trackpoint) conversion script
+├── verify_position.ts           # Position verification
+├── convert_values.ts            # Value conversion script
+├── aggregate_values.ts          # Aggregation script (raw → 5s → 60s → 1h)
+├── verify_values.ts             # Value verification
 ```
+
+No extra dependencies — `@duckdb/node-api` is already in the project's
+`node_modules`. Scripts run directly with `node --strip-types` (Node ≥ 22.6.0),
+which strips TypeScript type annotations without a compile step.
 
 ### Usage
 
 ```bash
-# From project root, with venv activated:
+# From project root:
 cd scripts/cassiopeia-parquet
 
 # Step 1: Convert raw values
-python convert_values.py \
+node --strip-types convert_values.ts \
   --input ../../stash-cassiopeia-data/cassiopeia_value.parquet \
   --output /path/to/signalk-data-dir
 
 # Step 2: Aggregate all tiers (raw → 5s → 60s → 1h)
-python aggregate_values.py \
+node --strip-types aggregate_values.ts \
   --data-dir /path/to/signalk-data-dir
 
 # Step 3: Verify
-python verify_values.py --data-dir /path/to/signalk-data-dir
+node --strip-types verify_values.ts --data-dir /path/to/signalk-data-dir
 ```
 
 ---
@@ -449,7 +465,7 @@ python verify_values.py --data-dir /path/to/signalk-data-dir
 
 | Issue | Decision |
 |-------|----------|
-| 138.8M rows won't fit in pandas | Use DuckDB for streaming partition-at-a-time extraction |
+| 138.8M rows won't fit in memory | Use DuckDB `COPY TO` for streaming partition-at-a-time extraction — no in-memory table |
 | `value` is FLOAT (32-bit) | Promote to DOUBLE (64-bit) to match plugin schema |
 | No separate received vs signalk timestamp | Use same value for both |
 | Non-standard paths (`headingMag`, `variation`) | Include as-is — the plugin handles arbitrary paths |
