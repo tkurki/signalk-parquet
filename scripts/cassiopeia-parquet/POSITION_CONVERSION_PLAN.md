@@ -94,62 +94,135 @@ one day's data for one context+path.
 
 ## Conversion Steps
 
-### Step 1: Read & validate source data
+### Step 1: Enumerate day partitions with DuckDB
 
 ```
-scripts/cassiopeia-parquet/convert.py
+scripts/cassiopeia-parquet/convert_position.py
 ```
 
-1. Open `stash-cassiopeia-data/cassiopeia_trackpoint.parquet` with PyArrow
-2. Filter out rows where lat/lng are out of range (|lat| > 90 or |lng| > 180)
-3. Decode `context` bytes → UTF-8 string
-4. Decode `sourceRef` bytes → UTF-8 string
-5. Reconstruct full ISO 8601 timestamp: `datetime.utcfromtimestamp(ts + millis/1000).isoformat() + 'Z'`
+Open the source file with DuckDB and query the distinct `(year, day_of_year)` partitions present, applying the lat/lng validity filter up-front:
 
-### Step 2: Transform columns
+```sql
+SELECT
+    CAST(ts / 86400 AS INTEGER) AS day_epoch
+FROM read_parquet('stash-cassiopeia-data/cassiopeia_trackpoint.parquet')
+WHERE lat BETWEEN -90 AND 90
+  AND lng BETWEEN -180 AND 180
+GROUP BY 1
+ORDER BY 1
+```
 
-For each row, produce a target record:
+### Step 2: Extract and transform one day at a time
+
+For each `day_epoch`, run a single DuckDB query that performs all column
+transformations in SQL and returns a PyArrow table:
+
+```sql
+SELECT
+    strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
+        || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z'
+        AS received_timestamp,
+    strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
+        || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z'
+        AS signalk_timestamp,
+    'vessels.' || CAST(context AS VARCHAR)  AS context,
+    'navigation.position'                   AS path,
+    lat                                     AS value_latitude,
+    lng                                     AS value_longitude,
+    CAST(sourceRef AS VARCHAR)              AS source,
+    CAST(sourceRef AS VARCHAR)              AS source_label
+FROM read_parquet('cassiopeia_trackpoint.parquet')
+WHERE lat BETWEEN -90 AND 90
+  AND lng BETWEEN -180 AND 180
+  AND CAST(ts / 86400 AS INTEGER) = ?
+ORDER BY ts, millis
+```
 
 | Target Column          | Source Expression |
 |-----------------------|-------------------|
-| `received_timestamp`  | ISO 8601 from `ts` + `millis` |
-| `signalk_timestamp`   | same as `received_timestamp` (only one timestamp in source) |
-| `context`             | `'vessels.' + context.decode('utf-8')` |
+| `received_timestamp`  | ISO 8601 built from `ts + millis/1000.0` |
+| `signalk_timestamp`   | same as `received_timestamp` |
+| `context`             | `'vessels.' \|\| CAST(context AS VARCHAR)` |
 | `path`                | `'navigation.position'` (constant) |
 | `value_latitude`      | `lat` |
 | `value_longitude`     | `lng` |
-| `source`              | `sourceRef.decode('utf-8')` |
-| `source_label`        | `sourceRef.decode('utf-8')` |
+| `source`              | `CAST(sourceRef AS VARCHAR)` |
+| `source_label`        | `CAST(sourceRef AS VARCHAR)` |
 
-### Step 3: Partition by day
+### Step 3: Write Hive-partitioned Parquet files
 
-Group transformed records by `(year, day_of_year)` derived from the timestamp.
-
-### Step 4: Write Hive-partitioned Parquet files
-
-For each `(year, day)` group:
+For each `(year, day)` group from the PyArrow result:
 1. Build target directory:
    ```
    {output_dir}/tier=raw/context=vessels__urn-mrn-imo-mmsi-230029970/path=navigation__position/year={YYYY}/day={DDD}/
    ```
-2. Sort records by `signalk_timestamp`
-3. Write as a single Parquet file per day:
+2. Write the already-sorted PyArrow table as a Parquet file:
    `data_{YYYYMMDD}T000000.parquet`
-4. Use Snappy compression (consistent with plugin's DuckDB consolidation)
+3. Use Snappy compression (consistent with plugin's DuckDB consolidation)
+
+### Step 4: Aggregation — not applicable
+
+`navigation.position` is an **object-type path** and is intentionally excluded from
+aggregation. The plugin's `aggregateTier` checks whether the source Parquet files
+contain a `value` column (required for DuckDB `AVG(CAST(value AS DOUBLE))`). Position
+files have `value_latitude` and `value_longitude` columns but no `value` column, so
+`aggregateTier` returns immediately with 0 records — the path stays `tier=raw` only.
+This is by design: there is no meaningful scalar average of a lat/lng pair.
+
+The batch conversion script therefore **skips aggregation entirely** for position data,
+consistent with the plugin's behaviour.
 
 ### Step 5: Verify output
 
 ```
-scripts/cassiopeia-parquet/verify.py
+scripts/cassiopeia-parquet/verify_position.py
 ```
 
-1. Glob all output `.parquet` files
-2. Read each with DuckDB/PyArrow and validate:
-   - Schema matches expected columns and types
-   - `value_latitude` and `value_longitude` are within valid ranges
-   - `signalk_timestamp` falls within the day indicated by the partition path
-   - Total row count across all files matches source (minus filtered rows)
-3. Spot-check: query a few days via DuckDB with Hive partitioning enabled to confirm partition pruning works
+1. Use DuckDB to count total rows across all output files and compare against source (minus filtered rows)
+2. Validate schema: columns and types match expectation
+3. Check `value_latitude` / `value_longitude` stay within valid ranges
+4. Verify `signalk_timestamp` falls within the day indicated by the partition path
+5. Confirm partition pruning works via Hive-aware DuckDB query
+
+## Implementation Strategy
+
+DuckDB handles all decoding of `BINARY` columns automatically when casting to `VARCHAR`. The conversion iterates over ~96 day partitions, extracting and writing one PyArrow table per day. With a maximum of ~607K rows on the busiest day, each partition fits comfortably in memory.
+
+```python
+# Pseudocode
+con = duckdb.connect()
+
+# Step 1: enumerate partitions
+day_epochs = [
+    row[0] for row in con.execute("""
+        SELECT CAST(ts / 86400 AS INTEGER)
+        FROM read_parquet('source.parquet')
+        WHERE lat BETWEEN -90 AND 90 AND lng BETWEEN -180 AND 180
+        GROUP BY 1 ORDER BY 1
+    """).fetchall()
+]
+
+for day_epoch in day_epochs:
+    # Step 2: extract + transform
+    arrow_table = con.execute("""
+        SELECT
+            strftime(...) AS received_timestamp,
+            strftime(...) AS signalk_timestamp,
+            'vessels.' || CAST(context AS VARCHAR) AS context,
+            'navigation.position' AS path,
+            lat AS value_latitude,
+            lng AS value_longitude,
+            CAST(sourceRef AS VARCHAR) AS source,
+            CAST(sourceRef AS VARCHAR) AS source_label
+        FROM read_parquet('source.parquet')
+        WHERE lat BETWEEN -90 AND 90 AND lng BETWEEN -180 AND 180
+          AND CAST(ts / 86400 AS INTEGER) = ?
+        ORDER BY ts, millis
+    """, [day_epoch]).arrow()
+
+    # Step 3: write to Hive path
+    pq.write_table(arrow_table, hive_path(day_epoch), compression='snappy')
+```
 
 ---
 
@@ -157,10 +230,14 @@ scripts/cassiopeia-parquet/verify.py
 
 ```
 scripts/cassiopeia-parquet/
-├── README.md              # Usage instructions
-├── convert.py             # Main conversion script
-├── verify.py              # Post-conversion verification
-└── requirements.txt       # Python deps (pyarrow, pandas)
+├── POSITION_CONVERSION_PLAN.md  # This document
+├── VALUE_CONVERSION_PLAN.md     # Value conversion plan
+├── README.md                    # Usage instructions
+├── convert_position.py          # Position conversion script
+├── verify_position.py           # Position verification
+├── convert_values.py            # Value conversion script
+├── verify_values.py             # Value verification
+└── requirements.txt             # Python deps (pyarrow, duckdb)
 ```
 
 ### Usage
@@ -170,12 +247,12 @@ scripts/cassiopeia-parquet/
 cd scripts/cassiopeia-parquet
 
 # Convert (writes to a configurable output directory)
-python convert.py \
+python convert_position.py \
   --input ../../stash-cassiopeia-data/cassiopeia_trackpoint.parquet \
   --output /path/to/signalk-data-dir
 
 # Verify
-python verify.py --data-dir /path/to/signalk-data-dir
+python verify_position.py --data-dir /path/to/signalk-data-dir
 ```
 
 ---
@@ -184,26 +261,35 @@ python verify.py --data-dir /path/to/signalk-data-dir
 
 | Issue | Decision |
 |-------|----------|
-| 137 rows with out-of-range lat/lng | Filter out, log count |
-| No separate `received_timestamp` vs `signalk_timestamp` in source | Use same value for both |
-| `quadkey` column | Drop (not used by plugin) |
-| `sourceRef` has 7 distinct values | Map directly to `source` and `source_label` |
-| Sub-second precision | Preserved via `millis` → ISO 8601 fractional seconds |
+| 137 rows with out-of-range lat/lng | Filtered in DuckDB `WHERE lat BETWEEN -90 AND 90 AND lng BETWEEN -180 AND 180`; count logged |
+| `BINARY` columns need decoding | DuckDB `CAST(... AS VARCHAR)` decodes UTF-8 bytes automatically |
+| No separate `received_timestamp` vs `signalk_timestamp` | Use same value for both |
+| `quadkey` column | Excluded from `SELECT` — not present in target schema |
+| `sourceRef` has 7 distinct values | Cast directly to `source` and `source_label` |
+| Sub-second precision | Preserved: `millis` appended as `.NNN` in ISO 8601 string in SQL |
 | Days with very few records (min 2) | Still create a partition file per day |
-| `context` prefix | Source has bare `urn:mrn:imo:mmsi:...`; target needs `vessels.` prefix |
+| `context` prefix | Prepend `'vessels.'` in SQL: `'vessels.' \|\| CAST(context AS VARCHAR)` |
 | Compression | Snappy (consistent with consolidate-parquet.sh) |
-| `value` column | Omitted — exploded object files don't include it |
-| days spanning year boundaries | Handled by computing day-of-year per UTC timestamp |
+| `value` column | Omitted from `SELECT` — exploded object files don't include it |
+| Days spanning year boundaries | DuckDB `ts / 86400` grouping naturally respects UTC day boundaries |
 
 ---
 
 ## Compatibility Verification
 
 After conversion, the output should be queryable by the plugin's DuckDB-based
-History API. Verification query (from `verify.py`):
+History API. Verification queries (from `verify_position.py`):
 
 ```sql
-SELECT signalk_timestamp, value_latitude, value_longitude
+-- Row count verification (should equal source minus 137 filtered rows)
+SELECT COUNT(*) as total_rows
+FROM read_parquet(
+  '{output_dir}/tier=raw/context=vessels__urn-mrn-imo-mmsi-230029970/path=navigation__position/year=*/day=*/*.parquet',
+  hive_partitioning=true
+);
+
+-- Spot-check: first 10 records in order
+SELECT signalk_timestamp, value_latitude, value_longitude, source
 FROM read_parquet(
   '{output_dir}/tier=raw/context=vessels__urn-mrn-imo-mmsi-230029970/path=navigation__position/year=*/day=*/*.parquet',
   hive_partitioning=true

@@ -187,7 +187,165 @@ For each `(path, year, day)` group:
    `data_{YYYYMMDD}T000000.parquet`
 5. Use Snappy compression
 
-### Step 5: Verify output
+### Step 5: Aggregate to higher tiers
+
+After all raw files are written, run the same aggregation logic the plugin uses
+(`aggregateDate` → `aggregateTier`), chained through the full tier hierarchy
+`raw → 5s → 60s → 1h`, for every day that has raw data.
+
+#### Aggregated-tier file schema
+
+Aggregated files use a different schema from raw:
+
+| Column             | Type      | Scalar paths | Angular paths |
+|--------------------|-----------|-------------|---------------|
+| `bucket_time`      | TIMESTAMP | time bucket start | time bucket start |
+| `context`          | VARCHAR   | ✓ | ✓ |
+| `path`             | VARCHAR   | ✓ | ✓ |
+| `value_avg`        | DOUBLE    | arithmetic mean | ATAN2(AVG(SIN), AVG(COS)) |
+| `value_min`        | DOUBLE    | minimum | NULL |
+| `value_max`        | DOUBLE    | maximum | NULL |
+| `sample_count`     | BIGINT    | ✓ | ✓ |
+| `value_sin_avg`    | DOUBLE    | absent | AVG(SIN(value)) |
+| `value_cos_avg`    | DOUBLE    | absent | AVG(COS(value)) |
+| `first_timestamp`  | VARCHAR   | ✓ | ✓ |
+| `last_timestamp`   | VARCHAR   | ✓ | ✓ |
+
+Output filename per day: `data_{YYYY-MM-DD}_aggregated.parquet` inside the same
+hive directory structure, e.g.:
+```
+tier=5s/context=vessels__urn-mrn-imo-mmsi-230029970/path=navigation__speedOverGround/year=2023/day=177/
+  data_2023-06-26_aggregated.parquet
+```
+
+#### Angular vs scalar path detection
+
+The plugin calls `app.getMetadata(path)` at runtime to check `units === 'rad'`.
+The batch script has no running SignalK server, so uses a static allowlist derived
+from the SignalK specification for all angular paths present in this dataset:
+
+```python
+ANGULAR_PATHS = {
+    # Navigation headings and courses (rad)
+    'navigation.headingMagnetic',
+    'navigation.headingTrue',
+    'navigation.headingTrueCalc',
+    'navigation.courseOverGroundTrue',
+    'navigation.courseOverGroundMagnetic',
+    'navigation.magneticVariation',
+    'navigation.courseGreatCircle.bearingTrackTrue',
+    'navigation.courseGreatCircle.nextPoint.bearingTrue',
+    # Wind angles (rad)
+    'environment.wind.angleApparent',
+    'environment.wind.angleTrueGround',
+    'environment.wind.angleTrueWater',
+    'environment.wind.directionGround',
+    'environment.wind.directionMagnetic',
+    'environment.wind.directionTrue',
+    # Steering (rad)
+    'steering.rudderAngle',
+    # Non-standard derived paths present in this dataset
+    'variation',
+    'headingMag',
+}
+```
+
+#### DuckDB aggregation queries (identical to plugin)
+
+**Scalar path, `raw → 5s`:**
+```sql
+COPY (
+  SELECT
+    time_bucket(INTERVAL '5 seconds', received_timestamp::TIMESTAMP) AS bucket_time,
+    context, path,
+    AVG(CASE WHEN value IS NOT NULL AND TRY_CAST(value AS DOUBLE) IS NOT NULL
+            THEN CAST(value AS DOUBLE) END) AS value_avg,
+    MIN(CASE WHEN value IS NOT NULL AND TRY_CAST(value AS DOUBLE) IS NOT NULL
+            THEN CAST(value AS DOUBLE) END) AS value_min,
+    MAX(CASE WHEN value IS NOT NULL AND TRY_CAST(value AS DOUBLE) IS NOT NULL
+            THEN CAST(value AS DOUBLE) END) AS value_max,
+    COUNT(*)                                AS sample_count,
+    MIN(received_timestamp)                 AS first_timestamp,
+    MAX(received_timestamp)                 AS last_timestamp
+  FROM read_parquet([<raw_files>], union_by_name=true)
+  GROUP BY bucket_time, context, path
+  ORDER BY bucket_time
+) TO '<output>' (FORMAT PARQUET, COMPRESSION 'SNAPPY');
+```
+
+**Angular path, `raw → 5s`:**
+```sql
+COPY (
+  SELECT
+    time_bucket(INTERVAL '5 seconds', received_timestamp::TIMESTAMP) AS bucket_time,
+    context, path,
+    ATAN2(AVG(SIN(CAST(value AS DOUBLE))),
+          AVG(COS(CAST(value AS DOUBLE))))  AS value_avg,
+    NULL::DOUBLE                            AS value_min,
+    NULL::DOUBLE                            AS value_max,
+    COUNT(*)                                AS sample_count,
+    AVG(SIN(CAST(value AS DOUBLE)))         AS value_sin_avg,
+    AVG(COS(CAST(value AS DOUBLE)))         AS value_cos_avg,
+    MIN(received_timestamp)                 AS first_timestamp,
+    MAX(received_timestamp)                 AS last_timestamp
+  FROM read_parquet([<raw_files>], union_by_name=true)
+  WHERE value IS NOT NULL AND TRY_CAST(value AS DOUBLE) IS NOT NULL
+  GROUP BY bucket_time, context, path
+  ORDER BY bucket_time
+) TO '<output>' (FORMAT PARQUET, COMPRESSION 'SNAPPY');
+```
+
+**Tier-to-tier re-aggregation (e.g. `5s → 60s`), scalar:**
+```sql
+COPY (
+  SELECT
+    time_bucket(INTERVAL '60 seconds', src_bucket_time::TIMESTAMP) AS bucket_time,
+    context, path,
+    SUM(value_avg * sample_count) / SUM(sample_count) AS value_avg,
+    MIN(value_min)                                    AS value_min,
+    MAX(value_max)                                    AS value_max,
+    SUM(sample_count)::BIGINT                         AS sample_count,
+    MIN(first_timestamp)                              AS first_timestamp,
+    MAX(last_timestamp)                               AS last_timestamp
+  FROM (SELECT bucket_time AS src_bucket_time, context, path,
+               value_avg, value_min, value_max, sample_count,
+               first_timestamp, last_timestamp
+        FROM read_parquet([<5s_files>], union_by_name=true)) src
+  GROUP BY 1, context, path
+  ORDER BY 1
+) TO '<output>' (FORMAT PARQUET, COMPRESSION 'SNAPPY');
+```
+
+**Tier-to-tier re-aggregation, angular** (uses stored `value_sin_avg`/`value_cos_avg`
+for correct weighted re-composition):
+```sql
+COPY (
+  SELECT
+    time_bucket(INTERVAL '60 seconds', src_bucket_time::TIMESTAMP) AS bucket_time,
+    context, path,
+    ATAN2(
+      SUM(value_sin_avg * sample_count) / SUM(sample_count),
+      SUM(value_cos_avg * sample_count) / SUM(sample_count)
+    )                                              AS value_avg,
+    NULL::DOUBLE                                   AS value_min,
+    NULL::DOUBLE                                   AS value_max,
+    SUM(sample_count)::BIGINT                      AS sample_count,
+    SUM(value_sin_avg * sample_count) / SUM(sample_count) AS value_sin_avg,
+    SUM(value_cos_avg * sample_count) / SUM(sample_count) AS value_cos_avg,
+    MIN(first_timestamp)                           AS first_timestamp,
+    MAX(last_timestamp)                            AS last_timestamp
+  FROM (SELECT bucket_time AS src_bucket_time, context, path,
+               value_sin_avg, value_cos_avg, sample_count,
+               first_timestamp, last_timestamp
+        FROM read_parquet([<5s_files>], union_by_name=true)) src
+  GROUP BY 1, context, path
+  ORDER BY 1
+) TO '<output>' (FORMAT PARQUET, COMPRESSION 'SNAPPY');
+```
+
+The same `60s → 1h` query applies with `INTERVAL '3600 seconds'`.
+
+### Step 6: Verify output
 
 ```
 scripts/cassiopeia-parquet/verify_values.py
@@ -195,9 +353,10 @@ scripts/cassiopeia-parquet/verify_values.py
 
 1. Glob all output `.parquet` files
 2. Validate per-path total row count matches source
-3. Schema check: columns and types are correct
+3. Schema check: columns and types are correct for both raw and aggregated tiers
 4. Verify timestamps fall within expected day partition
 5. Spot-check specific paths via DuckDB with Hive partition pruning
+6. Confirm aggregated tiers have progressively fewer rows per tier
 
 ---
 
@@ -254,14 +413,15 @@ This keeps memory usage proportional to one day of one path (~max 600K rows for 
 
 ```
 scripts/cassiopeia-parquet/
-├── CONVERSION_PLAN.md          # Trackpoint conversion plan (existing)
-├── VALUE_CONVERSION_PLAN.md    # This document
-├── README.md                   # Usage instructions
-├── convert.py                  # Trackpoint conversion script
-├── convert_values.py           # Value conversion script (new)
-├── verify.py                   # Trackpoint verification
-├── verify_values.py            # Value verification (new)
-└── requirements.txt            # Python deps (pyarrow, duckdb)
+├── POSITION_CONVERSION_PLAN.md  # Position conversion plan
+├── VALUE_CONVERSION_PLAN.md     # This document
+├── README.md                    # Usage instructions
+├── convert_position.py          # Position (trackpoint) conversion script
+├── verify_position.py           # Position verification
+├── convert_values.py            # Value conversion script
+├── aggregate_values.py          # Aggregation script (raw → 5s → 60s → 1h)
+├── verify_values.py             # Value verification
+└── requirements.txt             # Python deps (pyarrow, duckdb)
 ```
 
 ### Usage
@@ -270,12 +430,16 @@ scripts/cassiopeia-parquet/
 # From project root, with venv activated:
 cd scripts/cassiopeia-parquet
 
-# Convert values (writes to a configurable output directory)
+# Step 1: Convert raw values
 python convert_values.py \
   --input ../../stash-cassiopeia-data/cassiopeia_value.parquet \
   --output /path/to/signalk-data-dir
 
-# Verify
+# Step 2: Aggregate all tiers (raw → 5s → 60s → 1h)
+python aggregate_values.py \
+  --data-dir /path/to/signalk-data-dir
+
+# Step 3: Verify
 python verify_values.py --data-dir /path/to/signalk-data-dir
 ```
 
@@ -297,6 +461,9 @@ python verify_values.py --data-dir /path/to/signalk-data-dir
 | Compression | Snappy (consistent with plugin consolidation) |
 | `millis` sub-second precision | Preserved via ISO 8601 fractional seconds (`.NNN`) |
 | Some paths span 4 years, others just 1 day | Partition structure accommodates both naturally |
+| Angular path detection (no running SignalK server) | Static allowlist of 17 paths from SignalK spec (`units === 'rad'`) |
+| Tier-to-tier re-aggregation requires stored sin/cos for angular | 5s tier writes `value_sin_avg`/`value_cos_avg`; used by 60s and 1h aggregation |
+| Aggregation overwrites existing files | Consistent with plugin behaviour (`aggregateTier` does not check for existing output) |
 
 ---
 
@@ -306,10 +473,13 @@ python verify_values.py --data-dir /path/to/signalk-data-dir
 |--------|-------|
 | Source rows | 138,816,821 |
 | Distinct paths | 175 |
-| Distinct (path, day) partitions | ~4,000–6,000 (estimated) |
-| Largest single day/path | ~600K rows |
-| Expected output file count | ~4,000–6,000 `.parquet` files |
-| Expected total output size | ~2–4 GB (Snappy compressed) |
+| Distinct (path, day) raw partitions | ~4,000–6,000 (estimated) |
+| Largest single raw day/path | ~600K rows |
+| Aggregated tiers | 3 (`5s`, `60s`, `1h`) — one output file per path per day per tier |
+| Expected raw file count | ~4,000–6,000 `.parquet` files |
+| Expected aggregated file count | ~12,000–18,000 `.parquet` files (3× raw) |
+| Expected total output size | ~3–6 GB (raw + all aggregated tiers, Snappy compressed) |
+| Angular paths (vector averaging) | 17 (headings, courses, wind angles, rudder) |
 
 ---
 
