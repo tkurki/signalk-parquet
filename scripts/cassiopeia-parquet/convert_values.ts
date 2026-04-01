@@ -1,34 +1,43 @@
 #!/usr/bin/env node
 // Convert cassiopeia_value.parquet → Hive-partitioned scalar-value Parquet files.
 //
+// Strategy (two phases):
+//   Phase 1 — single pass through the source file, fanning out to one CSV
+//              staging file per SignalK path (DuckDB COPY TO PARTITION_BY).
+//   Phase 2 — for each per-path CSV, write one Parquet file per day into
+//              the Hive partition tree.
+//
 // Run with:
 //   node --experimental-strip-types convert_values.ts \
 //     --input  ../../stash-cassiopeia-data/cassiopeia_value.parquet \
 //     --output /path/to/signalk-data-dir
+//   [--keep-csv]   keep the _csv_staging directory after conversion
 
 import { DuckDBInstance } from '@duckdb/node-api';
-import { mkdirSync } from 'fs';
+import { mkdirSync, readdirSync, rmSync } from 'fs';
 import { join, resolve } from 'path';
 
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
-function parseArgs(): { input: string; output: string } {
+function parseArgs(): { input: string; output: string; keepCsv: boolean } {
   const args = process.argv.slice(2);
   let input = '';
   let output = '';
+  let keepCsv = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--input' && args[i + 1]) input = args[++i];
     else if (args[i] === '--output' && args[i + 1]) output = args[++i];
+    else if (args[i] === '--keep-csv') keepCsv = true;
   }
   if (!input || !output) {
     console.error(
-      'Usage: node --experimental-strip-types convert_values.ts --input <file> --output <dir>'
+      'Usage: node --experimental-strip-types convert_values.ts --input <file> --output <dir> [--keep-csv]'
     );
     process.exit(1);
   }
-  return { input: resolve(input), output: resolve(output) };
+  return { input: resolve(input), output: resolve(output), keepCsv };
 }
 
 // ---------------------------------------------------------------------------
@@ -53,6 +62,11 @@ function pad(n: number, w: number): string {
 /** Encode a SignalK path for use in a Hive directory name: dots → __ */
 function encodeHivePath(path: string): string {
   return path.replace(/\./g, '__');
+}
+
+/** Reverse of encodeHivePath (__ → .) — valid because SignalK paths only use dots. */
+function decodeHivePath(pathEnc: string): string {
+  return pathEnc.replace(/__/g, '.');
 }
 
 function buildHivePaths(
@@ -83,16 +97,20 @@ function buildHivePaths(
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  const { input, output } = parseArgs();
+  const { input, output, keepCsv } = parseArgs();
+
+  const safeInput = input.replace(/'/g, "''");
+  const csvDir = join(output, '_csv_staging');
+  const safeCsvDir = csvDir.replace(/'/g, "''");
 
   const instance = await DuckDBInstance.create(':memory:');
   const con = await instance.connect();
 
   // ------------------------------------------------------------------
-  // Summary counts
+  // Summary count
   // ------------------------------------------------------------------
   const totalResult = await con.runAndReadAll(
-    `SELECT COUNT(*) AS n FROM read_parquet('${input}')`
+    `SELECT COUNT(*) AS n FROM read_parquet('${safeInput}')`
   );
   const totalRows = (totalResult.getRowObjects()[0] as { n: bigint }).n;
 
@@ -101,71 +119,114 @@ async function main(): Promise<void> {
   console.log(`Source rows: ${totalRows.toLocaleString()}`);
   console.log();
 
-  // ------------------------------------------------------------------
-  // Step 1: Enumerate distinct (path, day_epoch) partitions
-  // ------------------------------------------------------------------
-  console.log('Enumerating partitions (path × day)…');
-  const safeInput = input.replace(/'/g, "''");
-  const partResult = await con.runAndReadAll(
-    `SELECT CAST(path AS VARCHAR) AS p,
-            CAST(ts / 86400 AS INTEGER) AS day_epoch
-     FROM read_parquet('${safeInput}')
-     GROUP BY 1, 2
-     ORDER BY 1, 2`
-  );
-  const partitions = partResult.getRowObjects() as Array<{
-    p: string;
-    day_epoch: number;
-  }>;
+  // ==================================================================
+  // Phase 1: Single pass — fan out to per-path CSV files
+  // ==================================================================
+  mkdirSync(csvDir, { recursive: true });
 
-  console.log(`Partitions (path × day): ${partitions.length.toLocaleString()}`);
+  console.log('Phase 1: streaming source → per-path CSV files…');
+  const t1 = Date.now();
+
+  // DuckDB COPY TO with PARTITION_BY does a single scan and writes one or
+  // more CSV chunk files per partition directory, e.g.:
+  //   _csv_staging/path_enc=navigation__speedOverGround/data_0.csv
+  //
+  // The partition column (path_enc) is stripped from the CSV content, so
+  // we retain the decoded `path` column separately.
+  // `day_epoch` is included so Phase 2 can partition by day cheaply.
+  await con.runAndReadAll(`
+    COPY (
+      SELECT
+        strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
+            || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z'
+            AS received_timestamp,
+        strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
+            || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z'
+            AS signalk_timestamp,
+        'vessels.' || CAST(context  AS VARCHAR) AS context,
+        CAST(path AS VARCHAR)                   AS path,
+        replace(CAST(path AS VARCHAR), '.', '__') AS path_enc,
+        CAST(ts / 86400 AS INTEGER)             AS day_epoch,
+        CAST(value AS DOUBLE)                   AS value,
+        CAST(sourceRef AS VARCHAR)              AS source,
+        CAST(sourceRef AS VARCHAR)              AS source_label
+      FROM read_parquet('${safeInput}')
+    ) TO '${safeCsvDir}' (FORMAT CSV, PARTITION_BY (path_enc), OVERWRITE_OR_IGNORE)
+  `);
+
+  const elapsed1 = ((Date.now() - t1) / 1000).toFixed(1);
+  console.log(`Phase 1 complete in ${elapsed1}s.`);
   console.log();
 
-  // ------------------------------------------------------------------
-  // Steps 2–4: Transform and write each partition via COPY TO
-  // ------------------------------------------------------------------
-  for (let i = 0; i < partitions.length; i++) {
-    const { p: pathStr, day_epoch: dayEpoch } = partitions[i];
-    const d = dayEpochToDate(dayEpoch);
-    const doy = utcDayOfYear(d);
-    const { dir, file } = buildHivePaths(output, pathStr, d);
+  // ==================================================================
+  // Phase 2: Per-path CSVs → per-day Hive-partitioned Parquet files
+  // ==================================================================
+  console.log('Phase 2: per-path CSV → per-day Parquet…');
+  const t2 = Date.now();
 
-    mkdirSync(dir, { recursive: true });
+  // Each subdirectory is named "path_enc=<encodedPath>"
+  const pathDirs = readdirSync(csvDir).filter((d) =>
+    d.startsWith('path_enc=')
+  );
+  console.log(`Paths found: ${pathDirs.length}`);
+  console.log();
 
-    // Escape single-quotes in path (e.g. unlikely but safe)
-    const safePathStr = pathStr.replace(/'/g, "''");
-    const safeFile = file.replace(/'/g, "''");
+  let totalParquet = 0;
 
-    const copySQL = `
-      COPY (
-        SELECT
-          strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
-              || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z'
-              AS received_timestamp,
-          strftime(to_timestamp(ts + millis / 1000.0), '%Y-%m-%dT%H:%M:%S.')
-              || lpad(CAST(millis % 1000 AS VARCHAR), 3, '0') || 'Z'
-              AS signalk_timestamp,
-          'vessels.' || CAST(context  AS VARCHAR) AS context,
-          CAST(path     AS VARCHAR)               AS path,
-          CAST(value    AS DOUBLE)                AS value,
-          CAST(sourceRef AS VARCHAR)              AS source,
-          CAST(sourceRef AS VARCHAR)              AS source_label
-        FROM read_parquet('${safeInput}')
-        WHERE CAST(path    AS VARCHAR) = '${safePathStr}'
-          AND CAST(ts / 86400 AS INTEGER) = ${dayEpoch}
-        ORDER BY ts, millis
-      ) TO '${safeFile}' (FORMAT PARQUET, COMPRESSION 'SNAPPY')
-    `;
+  for (let pi = 0; pi < pathDirs.length; pi++) {
+    const pathEnc = pathDirs[pi].slice('path_enc='.length);
+    const pathStr = decodeHivePath(pathEnc);
+    const safeCsvGlob = join(csvDir, pathDirs[pi], '*.csv').replace(/'/g, "''");
 
-    await con.runAndReadAll(copySQL);
+    // Find all distinct days present in this path's CSV(s)
+    const dayResult = await con.runAndReadAll(
+      `SELECT DISTINCT day_epoch FROM read_csv('${safeCsvGlob}') ORDER BY 1`
+    );
+    const days = (
+      dayResult.getRowObjects() as Array<{ day_epoch: number }>
+    ).map((r) => r.day_epoch);
 
-    if ((i + 1) % 100 === 0 || i + 1 === partitions.length) {
-      const pct = (((i + 1) / partitions.length) * 100).toFixed(1);
-      console.log(
-        `  [${pad(i + 1, 5)}/${partitions.length}]  ${pct}%` +
-          `  ${d.toISOString().slice(0, 10)}  day=${pad(doy, 3)}  ${pathStr}`
-      );
+    for (const dayEpoch of days) {
+      const d = dayEpochToDate(dayEpoch);
+      const { dir, file } = buildHivePaths(output, pathStr, d);
+      const safeFile = file.replace(/'/g, "''");
+
+      mkdirSync(dir, { recursive: true });
+
+      await con.runAndReadAll(`
+        COPY (
+          SELECT received_timestamp, signalk_timestamp, context, path,
+                 value, source, source_label
+          FROM read_csv('${safeCsvGlob}')
+          WHERE day_epoch = ${dayEpoch}
+          ORDER BY received_timestamp
+        ) TO '${safeFile}' (FORMAT PARQUET, COMPRESSION 'SNAPPY')
+      `);
+
+      totalParquet++;
     }
+
+    const pct = (((pi + 1) / pathDirs.length) * 100).toFixed(1);
+    console.log(
+      `  [${pad(pi + 1, 3)}/${pathDirs.length}]  ${pct}%` +
+        `  ${days.length} days  ${pathStr}`
+    );
+  }
+
+  const elapsed2 = ((Date.now() - t2) / 1000).toFixed(1);
+  console.log();
+  console.log(
+    `Phase 2 complete in ${elapsed2}s. Parquet files written: ${totalParquet.toLocaleString()}`
+  );
+
+  // ==================================================================
+  // Cleanup
+  // ==================================================================
+  if (!keepCsv) {
+    console.log('Removing CSV staging directory…');
+    rmSync(csvDir, { recursive: true, force: true });
+  } else {
+    console.log(`CSV staging kept at: ${csvDir}`);
   }
 
   console.log();
